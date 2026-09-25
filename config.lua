@@ -6,7 +6,10 @@ Config.DefaultKey = "G"
 Config.StopCommand = "carrydrop"
 Config.EnableStopKey = true
 Config.StopKey = "X"
-Config.StopControl = 73
+-- Optional raw game control in addition to StopKey; false keeps remapping authoritative.
+Config.StopControl = false
+Config.CarryStartTimeout = 6000
+Config.VehiclePlacementTimeout = 6000
 
 Config.Radial = {
     enabled = true,
@@ -62,10 +65,12 @@ Config.Text = {
     notCarrying = "你现在没有背着玩家",
     noVehicle = "附近没有可用车辆",
     vehicleFull = "这辆车没有空座位",
+    putInVehicleFailed = "没能把玩家放进车里，请重试",
     putInVehicle = "已把玩家放进车里",
     putInVehicleTarget = "你已被放进车里",
     noDeadPlayerInVehicle = "这辆车上没有死亡玩家",
     removedDeadFromVehicle = "已把死亡玩家从车上放下",
+    removeDeadFailed = "没能把死亡玩家从车上放下，请重试",
     removedDeadFromVehicleTarget = "你已被从车上放下"
 }
 

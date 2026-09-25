@@ -3,7 +3,8 @@ game "gta5"
 
 author "kongcheng"
 description "Standalone carry player script"
-version "1.2.0"
+version "1.2.1"
+dependency "ox_lib"
 
 shared_scripts {
     "@ox_lib/init.lua",

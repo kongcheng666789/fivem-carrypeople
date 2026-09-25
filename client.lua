@@ -2,10 +2,16 @@ local isCarrying = false
 local isCarried = false
 local carryTarget = nil
 local carriedBy = nil
+local currentSessionId = nil
+local pendingPlacementId = nil
+local lastClosedSessionId = 0
+local stateGeneration = 0
 local radialAdded = false
 local targetAdded = false
 local lastStopRequest = -1000
 local activeMeTexts = {}
+local deadVehicleCache = {}
+local lastDeadVehicleSweep = 0
 
 local function notify(message)
     if not message or message == "" then return end
@@ -105,18 +111,25 @@ local function stopCarryAnimations()
 end
 
 local function clearCarryState()
+    local hadCarry = isCarrying or isCarried
+    local wasCarried = isCarried
+    stateGeneration = stateGeneration + 1
     isCarrying = false
     isCarried = false
     carryTarget = nil
     carriedBy = nil
+    currentSessionId = nil
+    pendingPlacementId = nil
 
-    DetachEntity(PlayerPedId(), true, false)
+    if not hadCarry then return end
+    if wasCarried then DetachEntity(PlayerPedId(), true, false) end
     stopCarryAnimations()
     ClearPedTasks(PlayerPedId())
 
+    local generation = stateGeneration
     CreateThread(function()
         Wait(250)
-        stopCarryAnimations()
+        if stateGeneration == generation then stopCarryAnimations() end
     end)
 end
 
@@ -202,7 +215,7 @@ local function canStartCarry()
 end
 
 local function requestStopCarry()
-    if not isCarrying and not isCarried then return end
+    if not isCarrying and not isCarried and not currentSessionId and not pendingPlacementId then return end
 
     local now = GetGameTimer()
     if now - lastStopRequest < 800 then return end
@@ -233,7 +246,7 @@ local function requestCarryPlayer(player)
 end
 
 local function requestCarry()
-    if isCarrying or isCarried then
+    if isCarrying or isCarried or currentSessionId or pendingPlacementId then
         requestStopCarry()
         return
     end
@@ -245,7 +258,7 @@ local function requestCarry()
 end
 
 local function requestCarryFromEntity(entity)
-    if isCarrying or isCarried then
+    if isCarrying or isCarried or currentSessionId or pendingPlacementId then
         requestStopCarry()
         return
     end
@@ -372,7 +385,7 @@ local function requestPutInVehicle(vehicle)
         return
     end
 
-    TriggerServerEvent("carry_people:server:putInVehicle", netId, seat)
+    TriggerServerEvent("carry_people:server:putInVehicle", netId)
 end
 
 local function findDeadPlayerInVehicle(vehicle)
@@ -397,6 +410,23 @@ local function findDeadPlayerInVehicle(vehicle)
     end
 
     return closestPlayer, closestDistance
+end
+
+local function hasDeadPlayerInVehicle(vehicle)
+    local now = GetGameTimer()
+    if now - lastDeadVehicleSweep >= 10000 then
+        for entity, cached in pairs(deadVehicleCache) do
+            if now >= cached.expiresAt then deadVehicleCache[entity] = nil end
+        end
+        lastDeadVehicleSweep = now
+    end
+
+    local cached = deadVehicleCache[vehicle]
+    if cached and now < cached.expiresAt then return cached.hasPlayer end
+
+    local hasPlayer = findDeadPlayerInVehicle(vehicle) ~= -1
+    deadVehicleCache[vehicle] = { hasPlayer = hasPlayer, expiresAt = now + 300 }
+    return hasPlayer
 end
 
 local function requestRemoveDeadFromVehicle(vehicle)
@@ -453,20 +483,21 @@ RegisterCommand((Config.Vehicle and Config.Vehicle.removeDeadCommand) or "pullou
     requestRemoveDeadFromVehicle()
 end, false)
 
-CreateThread(function()
-    while true do
-        if isCarrying or isCarried then
-            Wait(0)
-
-            local stopControl = Config.StopControl or 73
-            if stopControl and (IsControlJustPressed(0, stopControl) or IsDisabledControlJustPressed(0, stopControl)) then
-                requestStopCarry()
+if Config.EnableStopKey ~= false and type(Config.StopControl) == "number" then
+    CreateThread(function()
+        while true do
+            if isCarrying or isCarried then
+                Wait(0)
+                local stopControl = Config.StopControl
+                if IsControlJustPressed(0, stopControl) or IsDisabledControlJustPressed(0, stopControl) then
+                    requestStopCarry()
+                end
+            else
+                Wait(500)
             end
-        else
-            Wait(500)
         end
-    end
-end)
+    end)
+end
 
 local function hasOxRadial()
     return GetResourceState("ox_lib") == "started"
@@ -564,7 +595,7 @@ local function addCarryTarget()
                             and not isCarried
                             and DoesEntityExist(entity)
                             and distance <= removeDeadDistance
-                            and findDeadPlayerInVehicle(entity) ~= -1
+                            and hasDeadPlayerInVehicle(entity)
                     end,
                     onSelect = function(data)
                         requestRemoveDeadFromVehicle(data.entity)
@@ -634,21 +665,37 @@ AddEventHandler("onResourceStop", function(resourceName)
     clearCarryState()
 end)
 
-RegisterNetEvent("carry_people:client:startCarrier", function(targetId)
+RegisterNetEvent("carry_people:client:startCarrier", function(targetId, sessionId)
+    if type(sessionId) ~= "number" or sessionId <= lastClosedSessionId then return end
+    if currentSessionId == sessionId and isCarrying then return end
+    if currentSessionId or pendingPlacementId then clearCarryState() end
+
+    stateGeneration = stateGeneration + 1
+    local generation = stateGeneration
+    currentSessionId = sessionId
     local anim = Config.Animations.carrier
-    if not loadAnimDict(anim.dict) then return end
+    if not loadAnimDict(anim.dict) then
+        if currentSessionId == sessionId then
+            lastClosedSessionId = sessionId
+            clearCarryState()
+            TriggerServerEvent("carry_people:server:startFailed", sessionId)
+        end
+        return
+    end
+    if currentSessionId ~= sessionId or stateGeneration ~= generation then return end
 
     isCarrying = true
     isCarried = false
     carryTarget = targetId
 
     TaskPlayAnim(PlayerPedId(), anim.dict, anim.anim, 8.0, -8.0, -1, anim.flag, 0.0, false, false, false)
+    TriggerServerEvent("carry_people:server:startReady", sessionId)
     notify(Config.Text.carrying)
 
     CreateThread(function()
-        while isCarrying do
+        while isCarrying and currentSessionId == sessionId do
             Wait(1000)
-            if not isCarrying then break end
+            if not isCarrying or currentSessionId ~= sessionId then break end
 
             if not IsEntityPlayingAnim(PlayerPedId(), anim.dict, anim.anim, 3) then
                 TaskPlayAnim(PlayerPedId(), anim.dict, anim.anim, 8.0, -8.0, -1, anim.flag, 0.0, false, false, false)
@@ -657,16 +704,32 @@ RegisterNetEvent("carry_people:client:startCarrier", function(targetId)
     end)
 end)
 
-RegisterNetEvent("carry_people:client:startCarried", function(carrierId)
+RegisterNetEvent("carry_people:client:startCarried", function(carrierId, sessionId)
+    if type(sessionId) ~= "number" or sessionId <= lastClosedSessionId then return end
+    if currentSessionId == sessionId and isCarried then return end
+    if currentSessionId or pendingPlacementId then clearCarryState() end
+
+    stateGeneration = stateGeneration + 1
+    local generation = stateGeneration
+    currentSessionId = sessionId
+
+    local function failStart()
+        if currentSessionId ~= sessionId then return end
+        lastClosedSessionId = sessionId
+        clearCarryState()
+        TriggerServerEvent("carry_people:server:startFailed", sessionId)
+    end
+
     local carrierPlayer = GetPlayerFromServerId(carrierId)
-    if carrierPlayer == -1 then return end
+    if carrierPlayer == -1 then return failStart() end
 
     local carrierPed = GetPlayerPed(carrierPlayer)
-    if not DoesEntityExist(carrierPed) then return end
+    if not DoesEntityExist(carrierPed) then return failStart() end
 
     local anim = Config.Animations.carried
     local offset = anim.offset
-    if not loadAnimDict(anim.dict) then return end
+    if not loadAnimDict(anim.dict) then return failStart() end
+    if currentSessionId ~= sessionId or stateGeneration ~= generation then return end
 
     isCarried = true
     isCarrying = false
@@ -691,10 +754,11 @@ RegisterNetEvent("carry_people:client:startCarried", function(carrierId)
     )
 
     TaskPlayAnim(PlayerPedId(), anim.dict, anim.anim, 8.0, -8.0, -1, anim.flag, 0.0, false, false, false)
+    TriggerServerEvent("carry_people:server:startReady", sessionId)
     notify(Config.Text.carried)
 
     CreateThread(function()
-        while isCarried do
+        while isCarried and currentSessionId == sessionId do
             Wait(0)
             DisableControlAction(0, 21, true)
             DisableControlAction(0, 22, true)
@@ -713,9 +777,9 @@ RegisterNetEvent("carry_people:client:startCarried", function(carrierId)
     end)
 
     CreateThread(function()
-        while isCarried do
+        while isCarried and currentSessionId == sessionId do
             Wait(1000)
-            if not isCarried then break end
+            if not isCarried or currentSessionId ~= sessionId then break end
 
             local currentCarrier = GetPlayerFromServerId(carriedBy or -1)
             if currentCarrier == -1 or not DoesEntityExist(GetPlayerPed(currentCarrier)) then
@@ -730,7 +794,10 @@ RegisterNetEvent("carry_people:client:startCarried", function(carrierId)
     end)
 end)
 
-RegisterNetEvent("carry_people:client:stop", function(showNotify)
+RegisterNetEvent("carry_people:client:stop", function(sessionId, showNotify)
+    if type(sessionId) ~= "number" or sessionId <= lastClosedSessionId then return end
+    lastClosedSessionId = sessionId
+    if currentSessionId ~= sessionId and pendingPlacementId ~= sessionId then return end
     local hadState = isCarrying or isCarried
     clearCarryState()
 
@@ -739,13 +806,28 @@ RegisterNetEvent("carry_people:client:stop", function(showNotify)
     end
 end)
 
-RegisterNetEvent("carry_people:client:putInVehicleDone", function()
+RegisterNetEvent("carry_people:client:putInVehicleDone", function(sessionId)
+    if currentSessionId ~= sessionId then return end
+    lastClosedSessionId = math.max(lastClosedSessionId, sessionId)
     clearCarryState()
     notify(Config.Text.putInVehicle)
 end)
 
-RegisterNetEvent("carry_people:client:putInVehicle", function(vehicleNetId, seat)
-    clearCarryState()
+RegisterNetEvent("carry_people:client:putInVehicleFailed", function(sessionId)
+    if currentSessionId == sessionId or pendingPlacementId == sessionId then
+        notify(Config.Text.putInVehicleFailed)
+    end
+end)
+
+RegisterNetEvent("carry_people:client:putInVehicleSuccess", function(sessionId)
+    if pendingPlacementId ~= sessionId then return end
+    pendingPlacementId = nil
+    lastClosedSessionId = math.max(lastClosedSessionId, sessionId)
+    notify(Config.Text.putInVehicleTarget)
+end)
+
+RegisterNetEvent("carry_people:client:putInVehicle", function(sessionId, vehicleNetId)
+    if currentSessionId ~= sessionId or not isCarried then return end
 
     local timeout = GetGameTimer() + 3000
     local vehicle = NetToVeh(vehicleNetId)
@@ -754,20 +836,48 @@ RegisterNetEvent("carry_people:client:putInVehicle", function(vehicleNetId, seat
         vehicle = NetToVeh(vehicleNetId)
     end
 
+    if currentSessionId ~= sessionId or not isCarried then return end
+
     if not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) then
         notify(Config.Text.noVehicle)
+        TriggerServerEvent("carry_people:server:putInVehicleResult", sessionId, false)
         return
     end
 
-    SetPedIntoVehicle(PlayerPedId(), vehicle, tonumber(seat) or 0)
-    notify(Config.Text.putInVehicleTarget)
+    local seatNumber = getFreePassengerSeat(vehicle)
+    local maxPassengers = GetVehicleMaxNumberOfPassengers(vehicle)
+    if seatNumber == nil or seatNumber ~= math.floor(seatNumber)
+        or seatNumber < -1 or seatNumber > 15
+        or (seatNumber == -1 and Config.Vehicle.allowDriverSeat ~= true)
+        or (seatNumber >= 0 and seatNumber >= maxPassengers)
+        or not IsVehicleSeatFree(vehicle, seatNumber)
+        or GetVehiclePedIsIn(PlayerPedId(), false) ~= 0 then
+        TriggerServerEvent("carry_people:server:putInVehicleResult", sessionId, false)
+        return
+    end
+
+    clearCarryState()
+    pendingPlacementId = sessionId
+    local ped = PlayerPedId()
+    SetPedIntoVehicle(ped, vehicle, seatNumber)
+    Wait(250)
+    if pendingPlacementId ~= sessionId then return end
+
+    local enteredVehicle = GetVehiclePedIsIn(ped, false) == vehicle
+    local succeeded = enteredVehicle and GetPedInVehicleSeat(vehicle, seatNumber) == ped
+    if not succeeded then notify(Config.Text.putInVehicleFailed) end
+    TriggerServerEvent("carry_people:server:putInVehicleResult", sessionId, succeeded, enteredVehicle)
 end)
 
 RegisterNetEvent("carry_people:client:removeFromVehicleDone", function()
     notify(Config.Text.removedDeadFromVehicle)
 end)
 
-RegisterNetEvent("carry_people:client:removeFromVehicle", function(vehicleNetId)
+RegisterNetEvent("carry_people:client:removeFromVehicleFailed", function()
+    notify(Config.Text.removeDeadFailed)
+end)
+
+RegisterNetEvent("carry_people:client:removeFromVehicle", function(vehicleNetId, removalId)
     local ped = PlayerPedId()
     local timeout = GetGameTimer() + 3000
     local vehicle = NetToVeh(vehicleNetId)
@@ -778,11 +888,12 @@ RegisterNetEvent("carry_people:client:removeFromVehicle", function(vehicleNetId)
     end
 
     if not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) then
-        vehicle = GetVehiclePedIsIn(ped, false)
-    end
-
-    if not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) then
         notify(Config.Text.noVehicle)
+        TriggerServerEvent("carry_people:server:removeFromVehicleResult", removalId, false)
+        return
+    end
+    if not isPlayerDeadLike(PlayerId()) or GetVehiclePedIsIn(ped, false) ~= vehicle then
+        TriggerServerEvent("carry_people:server:removeFromVehicleResult", removalId, false)
         return
     end
 
@@ -800,6 +911,7 @@ RegisterNetEvent("carry_people:client:removeFromVehicle", function(vehicleNetId)
     SetEntityHeading(ped, GetEntityHeading(vehicle))
     SetPedCanRagdoll(ped, true)
     SetPedToRagdoll(ped, 2500, 2500, 0, false, false, false)
+    TriggerServerEvent("carry_people:server:removeFromVehicleResult", removalId, true)
     notify(Config.Text.removedDeadFromVehicleTarget)
 end)
 
