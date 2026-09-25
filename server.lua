@@ -260,12 +260,19 @@ RegisterNetEvent("carry_people:server:putInVehicle", function(vehicleNetId, seat
         return
     end
 
-    local pending = { sessionId = sessionId, targetId = targetId, vehicleNetId = vehicleNetId, seat = seatNumber }
+    local placementTimeout = Config.VehiclePlacementTimeout or 6000
+    local pending = {
+        sessionId = sessionId,
+        targetId = targetId,
+        vehicleNetId = vehicleNetId,
+        seat = seatNumber,
+        expiresAt = GetGameTimer() + placementTimeout,
+    }
     pendingVehicles[sourceId] = pending
     TriggerClientEvent("carry_people:client:putInVehicle", targetId, sessionId, vehicleNetId, seatNumber)
 
-    SetTimeout(Config.VehiclePlacementTimeout or 6000, function()
-        if pendingVehicles[sourceId] == pending then
+    SetTimeout(placementTimeout, function()
+        if pendingVehicles[sourceId] == pending and not pending.verifying then
             if isPlayerOnline(sourceId) then
                 TriggerClientEvent("carry_people:client:putInVehicleFailed", sourceId, sessionId)
             end
@@ -294,12 +301,13 @@ RegisterNetEvent("carry_people:server:putInVehicleResult", function(sessionId, s
     end
 
     pending.verifying = true
-    local function verifyPlacement(attemptsLeft)
+    local function verifyPlacement()
         if pendingVehicles[carrierId] ~= pending or carrySessions[targetId] ~= sessionId then return end
 
+        local now = GetGameTimer()
         local vehicle = NetworkGetEntityFromNetworkId(pending.vehicleNetId)
         local targetPed = GetPlayerPed(targetId)
-        if vehicle and vehicle ~= 0 and DoesEntityExist(vehicle) and targetPed > 0
+        if now <= pending.expiresAt and vehicle and vehicle ~= 0 and DoesEntityExist(vehicle) and targetPed > 0
             and GetVehiclePedIsIn(targetPed, false) == vehicle
             and GetPedInVehicleSeat(vehicle, pending.seat) == targetPed then
             clearPair(carrierId)
@@ -309,15 +317,15 @@ RegisterNetEvent("carry_people:server:putInVehicleResult", function(sessionId, s
             return
         end
 
-        if attemptsLeft > 0 then
-            SetTimeout(250, function() verifyPlacement(attemptsLeft - 1) end)
-        else
+        if now >= pending.expiresAt then
             TriggerClientEvent("carry_people:client:putInVehicleFailed", carrierId, sessionId)
             stopCarry(carrierId, false)
+        else
+            SetTimeout(math.min(250, pending.expiresAt - now), verifyPlacement)
         end
     end
 
-    verifyPlacement(4)
+    verifyPlacement()
 end)
 
 RegisterNetEvent("carry_people:server:removeDeadFromVehicle", function(targetId, vehicleNetId)
