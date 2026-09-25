@@ -212,12 +212,14 @@ RegisterNetEvent("carry_people:server:stop", function()
     stopCarry(source, true)
 end)
 
-RegisterNetEvent("carry_people:server:putInVehicle", function(vehicleNetId)
+RegisterNetEvent("carry_people:server:putInVehicle", function(vehicleNetId, seatNumber)
     local sourceId = source
     vehicleNetId = tonumber(vehicleNetId)
 
     if not Config.Vehicle or Config.Vehicle.enabled == false then return end
     if not isIntegerInRange(vehicleNetId, 1, 65535) then return end
+    if not isIntegerInRange(seatNumber, -1, 15) then return end
+    if seatNumber == -1 and Config.Vehicle.allowDriverSeat ~= true then return end
     if carryRoles[sourceId] ~= "carrier" then return end
     if pendingVehicles[sourceId] then return end
 
@@ -253,9 +255,14 @@ RegisterNetEvent("carry_people:server:putInVehicle", function(vehicleNetId)
     if #(sourceCoords - vehicleCoords) > vehicleDistance then return end
     if not cooldownAllows(sourceId, "vehicle", 500) then return end
 
-    local pending = { sessionId = sessionId, targetId = targetId, vehicleNetId = vehicleNetId }
+    if GetPedInVehicleSeat(vehicle, seatNumber) ~= 0 then
+        TriggerClientEvent("carry_people:client:putInVehicleFailed", sourceId, sessionId)
+        return
+    end
+
+    local pending = { sessionId = sessionId, targetId = targetId, vehicleNetId = vehicleNetId, seat = seatNumber }
     pendingVehicles[sourceId] = pending
-    TriggerClientEvent("carry_people:client:putInVehicle", targetId, sessionId, vehicleNetId)
+    TriggerClientEvent("carry_people:client:putInVehicle", targetId, sessionId, vehicleNetId, seatNumber)
 
     SetTimeout(Config.VehiclePlacementTimeout or 6000, function()
         if pendingVehicles[sourceId] == pending then
@@ -293,7 +300,8 @@ RegisterNetEvent("carry_people:server:putInVehicleResult", function(sessionId, s
         local vehicle = NetworkGetEntityFromNetworkId(pending.vehicleNetId)
         local targetPed = GetPlayerPed(targetId)
         if vehicle and vehicle ~= 0 and DoesEntityExist(vehicle) and targetPed > 0
-            and GetVehiclePedIsIn(targetPed, false) == vehicle then
+            and GetVehiclePedIsIn(targetPed, false) == vehicle
+            and GetPedInVehicleSeat(vehicle, pending.seat) == targetPed then
             clearPair(carrierId)
             TriggerClientEvent("carry_people:client:putInVehicleDone", carrierId, sessionId)
             TriggerClientEvent("carry_people:client:putInVehicleSuccess", targetId, sessionId)
